@@ -241,11 +241,57 @@ Button wake is cheap here: GPIO 0/12/16 all have **external** pull-ups, so the
 whole `rtc_gpio_init` / `pullup_en` / `hold_en` +
 `esp_sleep_pd_config(RTC_PERIPH, ON)` dance can be dropped.
 
-### Stage 5 — Battery gauge + polish
+### Stage 5a — Visual design  ✅ DONE (2026-07-27)
+The Stage 3 screen worked but looked like a debug view: default GFX 5×7 bitmap
+font scaled 3×, primary-colour rectangles butted against the edge of the glass,
+and letters (`T`, `ESC`) where icons belong. Rebuilt as something that reads as
+part of Zwift.
+
+| Was | Now | Why |
+|---|---|---|
+| 5×7 bitmap, `setTextSize(3)` | Noto Sans Condensed at 26/18/14/11 px, generated to GFXfont by `tools/fontconvert.c` | An integer-scaled bitmap font is the loudest possible "unfinished". Costs ~11.6 KB flash — 0.35% of the partition |
+| `RGB565_DODGERBLUE` etc. | Zwift's own power-zone colours (Z2 blue, Z3 green, Z4 amber, Z6 red) + brand orange `#FC6719` | Colours already burned into the rider's eye from the HUD |
+| Square fills, 0 px margin | 10 px rounded corners, 4 px margins, 5 px gutters | Buttons running off the edge of the glass is the clearest tell of a layout done by arithmetic |
+| Every button equally loud | **Solid** nav cross, **outline** everything else | Visual weight follows urgency — see below |
+| `T`, `ESC`, `RIDE`, `OK` | bike, `MENU`/`ESC`, thumbs-up, tick | Icons name the *action*; the keystroke is small print |
+| pressed = invert to white | pressed = invert, with ink chosen by luminance (`inkOn()`) | White ink on Z4 amber is the AUTO-stalled warning — the one thing that must not wash out |
+
+**The one decision worth defending: solid vs outline.** The five navigation
+targets are filled slabs of colour; Ride On, AUTO, MENU and GARAGE are dark with
+a coloured rim. That is not a style choice. At a junction you have ~2 s and your
+eyes are on the road, so the arrows must be findable in peripheral vision, while
+the buttons you press while soft-pedalling should recede. Making everything loud
+is identical to making nothing loud.
+
+**Layout was deliberately NOT changed** — same nine buttons in the same nine
+places. Polish that moves controls costs you the muscle memory you have already
+built testing Stage 3, and buys nothing.
+
+**MEASURED COST: wake 224 ms → 262 ms** (+38 ms, +17%). That is 13% of the ~2 s
+junction budget rather than 11%, leaving ~1.74 s for reach, aim and tap. The
+trade was worth taking and needs no clawing back.
+
+Where the 38 ms most likely went — an estimate, *not* a measurement: custom-font
+`drawChar` emits one `writePixel` per lit pixel, individually, with a
+`startWrite`/`endWrite` around every character. The footer is three lines of
+~100 glyphs and is almost certainly the largest single block of it. So if a
+future stage ever needs the milliseconds back, **cut the footer first** — it is
+pure on-screen documentation, and deleting it costs nothing functional. Measure
+before and after rather than trusting this paragraph.
+
+**Verified before flashing** with `tools/preview/` — a host renderer that links
+the *real* font headers and a faithful port of `Arduino_GFX::drawChar`, and
+writes a PNG. It caught a thumbs-up glyph whose vertical knuckle gaps made it
+read as three raised fingers, and a pressed state (white ink on a pale tint)
+that had destroyed its own contrast. Both would have cost a flash cycle each to
+find on glass. It re-implements the drawing *primitives*, so it proves
+typography and layout, not Arduino_GFX itself — which was already working.
+
+### Stage 5b — Battery gauge
 SY6970 battery % (reuse the Stage 5 PMU work), fed to **`setBatteryLevel()`** so
 the host shows the remote's own battery natively via the BLE Battery Service.
-On-screen "advertising / connected" indicator, a visible key-map, a tap
-confirmation, and `setTxPower()` tuning.
+Then `setTxPower()` tuning. The status band already has room reserved for a
+battery pill next to the connection pill.
 
 ### Optional / later
 **Wire external buttons** — a 5-way tactile nav switch or 6 tacts on free GPIOs

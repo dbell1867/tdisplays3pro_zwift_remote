@@ -18,16 +18,21 @@
 //  with evidence instead of argument.
 //
 //  WHAT IS ON SCREEN
-//      +---------------------+
-//      |  Zwift Remote       |   status: connected / advertising
-//      |  CONNECTED  wake 62 |   + the measured wake latency
-//      +----+-----+----------+
-//      |    |  ^  |          |
-//      | <  | OK  |  >       |   the nav pad: 5 targets
-//      |    |  v  |          |
-//      +----+-----+----------+
-//      |  ESC     |    T     |
-//      +---------------------+
+//      +--------------------------+
+//      | / ZWIFT REMOTE  wake 224 |  wordmark + measured wake latency
+//      | (o CONNECTED)      RO 12 |  state pill + Ride On counter
+//      +------+--------+----------+
+//      | (db) |   ^    |   AUTO   |  Ride On  /  up  /  repeat toggle
+//      |  <   |   OK   |    >     |  the nav cross, in Zwift zone-2 blue
+//      |      |   v    |          |
+//      +------+--------+----------+
+//      |    MENU      |   (bike)  |  Esc  /  T
+//      +--------------------------+
+//
+//  The look is deliberate: Zwift's own power-zone colours, a condensed bold
+//  face generated from Noto Sans, and real icons rather than letters. The five
+//  navigation targets are solid slabs; everything else is a dark outline. See
+//  PadStyle below for why that split is a usability decision, not a taste one.
 //
 //  The physical rocker STAYS mapped to left/right and keeps working with the
 //  screen dark — so you can compare the two directly at the same junction.
@@ -38,6 +43,16 @@
 #include <Arduino_GFX_Library.h>    // ST7796 display driver
 #include <TouchDrvCSTXXX.hpp>       // SensorLib touch driver; auto-detects CST226SE
 #include <HijelHID_BLEKeyboard.h>   // NimBLE-based BLE HID keyboard (core 3.x)
+
+// Proportional fonts, generated from Noto Sans Condensed by tools/fontconvert.c.
+// The built-in GFX font is a 5x7 bitmap scaled by whole integers — at setTextSize(3)
+// every stroke is 3 px thick and every curve is a staircase, which is exactly why
+// the first cut looked like a debug screen rather than a product. A real font is
+// the single biggest visual upgrade available here, and it costs ~4.5 KB of flash.
+#include "fonts/ZwiftBold26.h"      // button labels
+#include "fonts/ZwiftBold18.h"      // wordmark
+#include "fonts/ZwiftBold14.h"      // status
+#include "fonts/ZwiftSmall11.h"     // captions + footer
 
 // ---------------------------------------------------------------------------
 //  Pins. Carried over from the board bring-up project — none of these are
@@ -70,6 +85,66 @@ constexpr uint8_t BTN_UI    =  0;   // screen dark: wake. screen lit: tap=Enter,
 
 constexpr int16_t SCREEN_W = 222;
 constexpr int16_t SCREEN_H = 480;
+
+// ---------------------------------------------------------------------------
+//  Palette.
+//
+//  RGB565 packs a colour into 16 bits: 5 red, 6 green, 5 blue (green gets the
+//  spare bit because the eye resolves green detail best). Writing those as hex
+//  literals is unreadable and unreviewable, so this converts from the ordinary
+//  8-8-8 values you can look up — at COMPILE time, so it costs nothing.
+//
+//  The accents are not invented. They are Zwift's own power-zone colours, the
+//  ones already burned into your eye from the HUD, plus the brand orange:
+//
+//      Z2 blue   #0996D8      Z3 green  #00A94F
+//      Z4 yellow #FFCB0E      Z6 red    #E4002B      brand #FC6719
+//
+//  Using them means the remote reads as part of the same product rather than a
+//  generic dev board sitting next to one.
+// ---------------------------------------------------------------------------
+static constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
+  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+constexpr uint16_t C_BG      = rgb(0x0A, 0x0E, 0x14);  // near-black, faintly blue
+constexpr uint16_t C_SURFACE = rgb(0x17, 0x1C, 0x24);  // unpressed outline buttons
+constexpr uint16_t C_LINE    = rgb(0x2B, 0x33, 0x40);  // hairlines and recesses
+constexpr uint16_t C_MUTED   = rgb(0x7C, 0x88, 0x99);  // captions, footer
+constexpr uint16_t C_WHITE   = rgb(0xFF, 0xFF, 0xFF);
+
+constexpr uint16_t C_ORANGE  = rgb(0xFC, 0x67, 0x19);  // Zwift brand
+constexpr uint16_t C_BLUE    = rgb(0x09, 0x96, 0xD8);  // zone 2 — navigation
+constexpr uint16_t C_GREEN   = rgb(0x00, 0xA9, 0x4F);  // zone 3 — go / connected
+constexpr uint16_t C_AMBER   = rgb(0xFF, 0xCB, 0x0E);  // zone 4 — armed but stalled
+constexpr uint16_t C_RED     = rgb(0xE4, 0x00, 0x2B);  // zone 6 — menu / escape
+constexpr uint16_t C_STEEL   = rgb(0x6E, 0x7D, 0x94);  // inert / off
+
+// Blend two RGB565 colours, t=0 gives a, t=255 gives b. Used for the pressed
+// tint and the subtle rim light on solid buttons.
+static uint16_t mix565(uint16_t a, uint16_t b, uint8_t t) {
+  int ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
+  int br = (b >> 11) & 0x1F, bg = (b >> 5) & 0x3F, bb = b & 0x1F;
+  int r = ar + ((br - ar) * t) / 255;
+  int g = ag + ((bg - ag) * t) / 255;
+  int l = ab + ((bb - ab) * t) / 255;
+  return (uint16_t)((r << 11) | (g << 5) | l);
+}
+
+// Pick legible ink for a filled background.
+//
+// This is not fussiness. Hard-coding white ink puts white on Zwift's zone-4
+// amber, which is the colour the AUTO button turns when the link has dropped —
+// the one message on this screen you must not be able to miss. Deciding from
+// perceived brightness (green counts for more than red, red for more than blue)
+// keeps every fill readable no matter which state colour lands underneath.
+static uint16_t inkOn(uint16_t bg) {
+  int r = ((bg >> 11) & 0x1F) * 255 / 31;
+  int g = ((bg >> 5)  & 0x3F) * 255 / 63;
+  int b = (bg & 0x1F) * 255 / 31;
+  int lum = (77 * r + 151 * g + 28 * b) >> 8;
+  return (lum > 150) ? C_BG : C_WHITE;
+}
 
 constexpr uint32_t DEBOUNCE_MS = 25;
 constexpr uint32_t HOLD_MS     = 400;   // BTN_UI: longer than this is a hold, not a tap
@@ -127,45 +202,82 @@ HijelHID_BLEKeyboard keyboard("Zwift Remote", "dcbmah");
 //  Making Esc/OK/T hold-style too costs nothing and removes every special case:
 //  resting your finger on Esc repeats Esc, which is what a real keyboard does.
 // ---------------------------------------------------------------------------
-enum class Glyph : uint8_t { Text, Up, Down, Left, Right };
+enum class Glyph : uint8_t { None, Up, Down, Left, Right, Check, ThumbUp, Bike };
 
 //  Most pad buttons send a key. One does not: the AUTO button toggles the
 //  repeating Ride On below, so it needs its own kind rather than a keycode.
 enum class PadKind : uint8_t { Key, ToggleAuto };
 
+//  VISUAL WEIGHT FOLLOWS URGENCY.
+//
+//  Solid buttons are filled slabs of colour: maximum contrast, findable with a
+//  glance you cannot afford to take. Outline buttons are dark with a coloured
+//  rim: legible, but they recede.
+//
+//  The split is not decoration. At a junction you have about two seconds and
+//  you are looking at the road, so the four arrows and the confirm are Solid.
+//  Ride On, AUTO, MENU and GARAGE are things you do while soft-pedalling, so
+//  they are Outline and stay out of the way. Making everything loud is the same
+//  as making nothing loud.
+enum class PadStyle : uint8_t { Solid, Outline };
+
 struct PadButton {
   int16_t     x, y, w, h;
-  const char *label;    // drawn when glyph == Glyph::Text
+  const char *label;    // large text, drawn when non-empty
+  const char *caption;  // small text along the bottom edge, may be ""
   Glyph       glyph;
   uint8_t     keycode;
   uint16_t    color;
   PadKind     kind;
+  PadStyle    style;
 };
 
-// Grid geometry: three 70px columns with 6px gaps exactly fills 222px.
-constexpr int16_t CW = 70, CH = 70;
-constexpr int16_t COL0 = 0, COL1 = 76, COL2 = 152;
-constexpr int16_t ROW0 = 96, ROW1 = 172, ROW2 = 248;
-constexpr int16_t BOT_Y = 336, BOT_H = 76, BOT_W = 108;
+// Grid geometry. Three 68px columns, 5px gutters, 4px margins: 3*68 + 2*5 + 2*4
+// is exactly 222. The margins are new — the old layout ran the outer buttons
+// off the edge of the glass, which is the single clearest tell of a screen laid
+// out by arithmetic rather than by eye.
+constexpr int16_t CW = 68, CH = 68;
+constexpr int16_t COL0 = 4, COL1 = 77, COL2 = 150;
+constexpr int16_t ROW0 = 94, ROW1 = 167, ROW2 = 240;
+constexpr int16_t BOT_Y = 316, BOT_H = 78;
+constexpr int16_t BOT_W = 104;                 // (222 - 2*4 - 5) / 2, rounded down
+
+constexpr int16_t HEADER_H = 88;               // status band above the pad
+constexpr int16_t RADIUS   = 10;               // corner rounding, all buttons
 
 PadButton pad[] = {
-  // The nav cluster.
-  { COL1, ROW0, CW, CH, "",    Glyph::Up,    KEY_UP,     RGB565_DODGERBLUE, PadKind::Key },
-  { COL0, ROW1, CW, CH, "",    Glyph::Left,  KEY_LEFT,   RGB565_DODGERBLUE, PadKind::Key },
-  { COL1, ROW1, CW, CH, "OK",  Glyph::Text,  KEY_RETURN, RGB565_DARKGREEN,  PadKind::Key },
-  { COL2, ROW1, CW, CH, "",    Glyph::Right, KEY_RIGHT,  RGB565_DODGERBLUE, PadKind::Key },
-  { COL1, ROW2, CW, CH, "",    Glyph::Down,  KEY_DOWN,   RGB565_DODGERBLUE, PadKind::Key },
+  // The nav cluster — the time-critical five.
+  { COL1, ROW0, CW, CH, "", "", Glyph::Up,    KEY_UP,     C_BLUE,  PadKind::Key, PadStyle::Solid },
+  { COL0, ROW1, CW, CH, "", "", Glyph::Left,  KEY_LEFT,   C_BLUE,  PadKind::Key, PadStyle::Solid },
+  { COL1, ROW1, CW, CH, "", "", Glyph::Check, KEY_RETURN, C_GREEN, PadKind::Key, PadStyle::Solid },
+  { COL2, ROW1, CW, CH, "", "", Glyph::Right, KEY_RIGHT,  C_BLUE,  PadKind::Key, PadStyle::Solid },
+  { COL1, ROW2, CW, CH, "", "", Glyph::Down,  KEY_DOWN,   C_BLUE,  PadKind::Key, PadStyle::Solid },
 
-  // The 3x3 grid's corners were empty, so the new buttons cost no layout churn
-  // and no paging. F3 is a Ride On *bomb* — one press thanks every rider near
-  // you, not just one.
-  { COL0, ROW0, CW, CH, "RIDE", Glyph::Text, KEY_F3, RGB565_ORANGE,  PadKind::Key        },
-  { COL2, ROW0, CW, CH, "AUTO", Glyph::Text, 0,      RGB565_DARKGREY, PadKind::ToggleAuto },
+  // The 3x3 grid's corners were empty, so these cost no layout churn and no
+  // paging. F3 is a Ride On *bomb* — one press thanks every rider near you.
+  { COL0, ROW0, CW, CH, "",     "RIDE ON", Glyph::ThumbUp, KEY_F3, C_ORANGE, PadKind::Key,        PadStyle::Outline },
+  { COL2, ROW0, CW, CH, "AUTO", "",        Glyph::None,    0,      C_STEEL,  PadKind::ToggleAuto, PadStyle::Outline },
 
-  { COL0,   BOT_Y, BOT_W, BOT_H, "ESC", Glyph::Text, KEY_ESCAPE, RGB565_RED,    PadKind::Key },
-  { BOT_W+6, BOT_Y, BOT_W, BOT_H, "T",  Glyph::Text, KEY_T,      RGB565_PURPLE, PadKind::Key },
+  // Labelled by what they DO in Zwift, with the keystroke as the small print.
+  // "ESC" and "T" describe the wire; "MENU" and "GARAGE" describe the ride.
+  { COL0,        BOT_Y, BOT_W, BOT_H, "MENU", "ESC", Glyph::None, KEY_ESCAPE, C_RED,   PadKind::Key, PadStyle::Outline },
+  { COL0+BOT_W+5,BOT_Y, BOT_W, BOT_H, "",  "GARAGE", Glyph::Bike, KEY_T,      C_STEEL, PadKind::Key, PadStyle::Outline },
 };
 constexpr size_t PAD_COUNT = sizeof(pad) / sizeof(pad[0]);
+
+// For the serial log: a button's most useful human name.
+static const char *padName(const PadButton &b) {
+  if (b.caption[0]) return b.caption;
+  if (b.label[0])   return b.label;
+  switch (b.glyph) {
+    case Glyph::Up:    return "UP";
+    case Glyph::Down:  return "DOWN";
+    case Glyph::Left:  return "LEFT";
+    case Glyph::Right: return "RIGHT";
+    case Glyph::Check: return "ENTER";
+    default:           return "?";
+  }
+}
 
 // Which pad button is currently held, or nullptr. A pointer, so it can refer to
 // whichever button is active — or to none.
@@ -291,11 +403,134 @@ static void arrowUpdate(ArrowButton &a, bool connected) {
 // ---------------------------------------------------------------------------
 //  Drawing.
 // ---------------------------------------------------------------------------
+// --- Text ------------------------------------------------------------------
+//
+//  With a proportional font the cursor sits on the BASELINE, not the top-left
+//  corner, and every glyph is a different width — so you can no longer guess a
+//  string's size from strlen(). getTextBounds() measures the real ink box, and
+//  centring against that measurement is what stops labels drifting a few pixels
+//  off in every button, which is precisely the sort of thing the eye reads as
+//  "unfinished" without being able to say why.
+
+static int16_t textWidth(const char *s, const GFXfont *f) {
+  int16_t x1, y1; uint16_t w, h;
+  gfx->setFont(f);
+  gfx->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  return (int16_t)w;
+}
+
+static void textAt(const char *s, const GFXfont *f, int16_t x, int16_t baseline, uint16_t color) {
+  gfx->setFont(f);
+  gfx->setTextColor(color);
+  gfx->setCursor(x, baseline);
+  gfx->print(s);
+}
+
+static void textRight(const char *s, const GFXfont *f, int16_t rightX, int16_t baseline, uint16_t color) {
+  textAt(s, f, rightX - textWidth(s, f), baseline, color);
+}
+
+// Centre the ink box on (cx, cy) — not the advance box, so a string of capitals
+// sits optically centred rather than floating high on its descender space.
+static void textCentred(const char *s, const GFXfont *f, int16_t cx, int16_t cy, uint16_t color) {
+  int16_t x1, y1; uint16_t w, h;
+  gfx->setFont(f);
+  gfx->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  gfx->setTextColor(color);
+  gfx->setCursor(cx - w / 2 - x1, cy - h / 2 - y1);
+  gfx->print(s);
+}
+
+// Drop to the smaller face rather than let a label overrun its button. Cheaper
+// and more honest than picking one size and hoping every label fits forever.
+static const GFXfont *fitLabel(const char *s, int16_t maxW) {
+  return (textWidth(s, &ZwiftBold26) <= maxW) ? &ZwiftBold26 : &ZwiftBold18;
+}
+
+// --- Icons -----------------------------------------------------------------
+
+// A head PLUS a shaft. The old bare triangle was really a "play" symbol; adding
+// the shaft is what makes it unambiguously an arrow at a glance.
+static void drawArrow(Glyph g, int16_t cx, int16_t cy, int16_t s, uint16_t c) {
+  constexpr int16_t T = 6;   // half the shaft thickness
+  switch (g) {
+    case Glyph::Up:
+      gfx->fillTriangle(cx, cy - s, cx - s, cy, cx + s, cy, c);
+      gfx->fillRect(cx - T, cy, 2 * T, s, c);                     break;
+    case Glyph::Down:
+      gfx->fillTriangle(cx, cy + s, cx - s, cy, cx + s, cy, c);
+      gfx->fillRect(cx - T, cy - s, 2 * T, s, c);                 break;
+    case Glyph::Left:
+      gfx->fillTriangle(cx - s, cy, cx, cy - s, cx, cy + s, c);
+      gfx->fillRect(cx, cy - T, s, 2 * T, c);                     break;
+    case Glyph::Right:
+      gfx->fillTriangle(cx + s, cy, cx, cy - s, cx, cy + s, c);
+      gfx->fillRect(cx - s, cy - T, s, 2 * T, c);                 break;
+    default: break;
+  }
+}
+
+// A thick segment, as two triangles forming a sheared quad. The shear is
+// invisible on short diagonal strokes and saves a rotation.
+static void thickSeg(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t t, uint16_t c) {
+  gfx->fillTriangle(x0, y0, x1, y1, x1, y1 + t, c);
+  gfx->fillTriangle(x0, y0, x1, y1 + t, x0, y0 + t, c);
+}
+
+static void drawCheck(int16_t cx, int16_t cy, uint16_t c) {
+  thickSeg(cx - 16, cy - 2, cx - 5, cy + 9, 8, c);
+  thickSeg(cx - 5,  cy + 9, cx + 16, cy - 13, 8, c);
+}
+
+// Zwift's Ride On is a thumbs-up, so this is a thumbs-up.
+//
+// The first attempt drew a wrist, a fist and VERTICAL knuckle gaps, and it
+// read as three raised fingers — a rude gesture, not a compliment. The fix is
+// anatomical: seen from the side, curled fingers stack HORIZONTALLY, and the
+// thumb rises from the near edge of the fist rather than its centre. Two
+// creases are enough; a third starts to look like corduroy.
+static void drawThumbUp(int16_t cx, int16_t cy, uint16_t c, uint16_t fill) {
+  gfx->fillRoundRect(cx - 17, cy - 2,  34, 20, 6, c);   // fist
+  gfx->fillRoundRect(cx - 14, cy - 19, 12, 19, 5, c);   // thumb, up from the left
+  gfx->fillRect(cx - 1, cy + 4,  14, 1, fill);          // finger creases
+  gfx->fillRect(cx - 1, cy + 11, 14, 1, fill);
+}
+
+// A 2px stroke at any angle: the line plus both single-pixel offsets.
+static void stroke2(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t c) {
+  gfx->drawLine(x0, y0, x1, y1, c);
+  gfx->drawLine(x0 + 1, y0, x1 + 1, y1, c);
+  gfx->drawLine(x0, y0 + 1, x1, y1 + 1, c);
+}
+
+// The garage is where the bikes live, so the button is a bike. Diamond frame,
+// two wheels, saddle and bars — enough for the eye to name it instantly.
+static void drawBike(int16_t cx, int16_t cy, uint16_t c) {
+  const int16_t rh_x = cx - 22, fh_x = cx + 22, hub_y = cy + 7;
+  const int16_t bb_x = cx - 1,  st_x = cx - 9,  st_y   = cy - 9;
+  const int16_t ht_x = cx + 13, ht_y = cy - 11;
+
+  for (int16_t r = 12; r >= 11; r--) {            // 2px rims
+    gfx->drawCircle(rh_x, hub_y, r, c);
+    gfx->drawCircle(fh_x, hub_y, r, c);
+  }
+  stroke2(rh_x, hub_y, st_x, st_y, c);            // seat stay
+  stroke2(st_x, st_y, bb_x, hub_y, c);            // seat tube
+  stroke2(bb_x, hub_y, rh_x, hub_y, c);           // chain stay
+  stroke2(st_x, st_y, ht_x, ht_y, c);             // top tube
+  stroke2(ht_x, ht_y, bb_x, hub_y, c);            // down tube
+  stroke2(ht_x, ht_y, fh_x, hub_y, c);            // fork
+  stroke2(cx - 16, st_y - 3, cx - 4, st_y - 3, c);// saddle
+  stroke2(ht_x - 2, ht_y - 3, ht_x + 8, ht_y - 3, c); // bars
+}
+
+// --- Buttons ---------------------------------------------------------------
+
 static void drawPadButton(const PadButton &b, bool pressed) {
   // The AUTO toggle colours itself from its state rather than a fixed colour,
   // so the button IS the indicator. Three states, not two:
   //
-  //    grey   — off
+  //    STEEL  — off
   //    GREEN  — armed AND connected, i.e. genuinely sending
   //    AMBER  — armed but DISCONNECTED, so nothing is going out
   //
@@ -303,44 +538,71 @@ static void drawPadButton(const PadButton &b, bool pressed) {
   // so after a reflash or a dropped link the repeat silently stalls — and an
   // indicator that reads "running" while nothing happens is worse than no
   // indicator at all. Never let a status light show intent instead of reality.
-  uint16_t base;
+  uint16_t accent;
   if (b.kind == PadKind::ToggleAuto) {
-    base = !autoRideOn               ? RGB565_DARKGREY
-         : keyboard.isConnected()    ? RGB565_GREEN
-                                     : RGB565_ORANGE;
+    accent = !autoRideOn            ? C_STEEL
+           : keyboard.isConnected() ? C_GREEN
+                                    : C_AMBER;
   } else {
-    base = b.color;
-  }
-  uint16_t bg = pressed ? RGB565_WHITE : base;
-  uint16_t fg = pressed ? base         : RGB565_WHITE;
-  gfx->fillRect(b.x, b.y, b.w, b.h, bg);
-
-  int16_t cx = b.x + b.w / 2;
-  int16_t cy = b.y + b.h / 2;
-
-  if (b.glyph == Glyph::Text) {
-    gfx->setTextColor(fg);
-    gfx->setTextSize(3);
-    int16_t tw = (int16_t)strlen(b.label) * 18;   // size-3 char is ~18 px wide
-    gfx->setCursor(cx - tw / 2, cy - 12);         // ...and ~24 px tall
-    gfx->print(b.label);
-    return;
+    accent = b.color;
   }
 
-  // An arrow: a filled triangle reads far better than an ASCII "^" or "v", and
-  // the default GFX font has no arrow glyphs anyway.
-  constexpr int16_t S = 18;
+  // Pressed INVERTS the button rather than merely tinting it. A tint that keeps
+  // white ink on a paler fill destroys the very contrast that made the glyph
+  // findable — and the pressed state is the one you look at while holding a
+  // turn. Whatever the state, ink and fill stay far apart.
+  uint16_t fill, ink, sub, rim;
+  if (b.style == PadStyle::Solid) {
+    fill = pressed ? mix565(accent, C_WHITE, 175) : accent;
+    ink  = pressed ? accent : C_WHITE;   // dark-on-light while held
+    sub  = ink;
+    // A rim one shade off the fill reads as a lit edge and lifts the slab off
+    // the background — the cheapest depth cue there is, one drawRoundRect.
+    rim  = pressed ? C_WHITE : mix565(accent, C_WHITE, 70);
+  } else {
+    fill = pressed ? accent : C_SURFACE;
+    ink  = pressed ? inkOn(accent) : accent;
+    sub  = pressed ? inkOn(accent) : C_MUTED;
+    rim  = pressed ? C_WHITE : accent;
+  }
+
+  gfx->fillRoundRect(b.x, b.y, b.w, b.h, RADIUS, fill);
+  gfx->drawRoundRect(b.x, b.y, b.w, b.h, RADIUS, rim);
+  gfx->drawRoundRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2, RADIUS - 1, rim);
+
+  // AUTO advertises its own cadence, derived from the constant so the label can
+  // never drift away from what the code actually does.
+  char autoCap[8];
+  const char *caption = b.caption;
+  if (b.kind == PadKind::ToggleAuto) {
+    snprintf(autoCap, sizeof(autoCap), "%luS", (unsigned long)(RIDE_ON_INTERVAL_MS / 1000));
+    caption = autoCap;
+  }
+
+  const bool  hasCap = caption[0] != '\0';
+  const int16_t cx   = b.x + b.w / 2;
+  // Captioned buttons lift their glyph to keep the pair optically centred.
+  const int16_t cy   = b.y + (hasCap ? (b.h - 14) / 2 : b.h / 2);
+
   switch (b.glyph) {
-    case Glyph::Up:
-      gfx->fillTriangle(cx, cy - S, cx - S, cy + S, cx + S, cy + S, fg); break;
-    case Glyph::Down:
-      gfx->fillTriangle(cx, cy + S, cx - S, cy - S, cx + S, cy - S, fg); break;
-    case Glyph::Left:
-      gfx->fillTriangle(cx - S, cy, cx + S, cy - S, cx + S, cy + S, fg); break;
-    case Glyph::Right:
-      gfx->fillTriangle(cx + S, cy, cx - S, cy - S, cx - S, cy + S, fg); break;
-    default: break;
+    case Glyph::Up: case Glyph::Down: case Glyph::Left: case Glyph::Right:
+      drawArrow(b.glyph, cx, cy, 17, ink);          break;
+    case Glyph::Check:   drawCheck(cx, cy, ink);    break;
+    case Glyph::ThumbUp: drawThumbUp(cx, cy, ink, fill); break;
+    case Glyph::Bike:    drawBike(cx, cy, ink);     break;
+    case Glyph::None:    break;
   }
+
+  if (b.label[0]) textCentred(b.label, fitLabel(b.label, b.w - 14), cx, cy, ink);
+  if (hasCap)     textCentred(caption, &ZwiftSmall11, cx, b.y + b.h - 13, sub);
+}
+
+// The two unused corners of the 3x3 grid, drawn as shallow recesses. Left
+// black they looked like a rendering bug; given an edge they read as a
+// deliberate cross-shaped D-pad.
+static void drawRecess(int16_t x, int16_t y) {
+  gfx->fillRoundRect(x, y, CW, CH, RADIUS, mix565(C_BG, C_SURFACE, 110));
+  gfx->drawRoundRect(x, y, CW, CH, RADIUS, C_LINE);
 }
 
 // Repaint just the AUTO toggle. Needed because its colour depends on the BLE
@@ -359,52 +621,66 @@ static void drawAutoButton() {
 
 // Redraw just the status band, so tapping a button doesn't flicker the whole pad.
 static void drawStatus(bool connected) {
-  gfx->fillRect(0, 0, SCREEN_W, 90, RGB565_BLACK);
+  gfx->fillRect(0, 0, SCREEN_W, HEADER_H, C_BG);
 
-  gfx->setTextColor(RGB565_WHITE);
-  gfx->setTextSize(2);
-  gfx->setCursor(6, 10);
-  gfx->print("Zwift Remote");
+  // Brand mark: a slanted orange bar, in the spirit of Zwift's own chevron
+  // without copying the logo. Two triangles make the parallelogram.
+  gfx->fillTriangle(4, 32, 11, 11, 17, 11, C_ORANGE);
+  gfx->fillTriangle(4, 32, 17, 11, 10, 32, C_ORANGE);
 
-  gfx->setTextColor(connected ? RGB565_GREEN : RGB565_ORANGE);
-  gfx->setCursor(6, 36);
-  gfx->print(connected ? "CONNECTED" : "ADVERTISING");
+  // "ZWIFT" in brand orange, "REMOTE" in white: says whose ecosystem this
+  // belongs to and that it is not the game itself, in one line.
+  int16_t x = 23;
+  textAt("ZWIFT", &ZwiftBold18, x, 31, C_ORANGE);
+  x += textWidth("ZWIFT", &ZwiftBold18) + 7;
+  textAt("REMOTE", &ZwiftBold18, x, 31, C_WHITE);
 
-  // The number this whole stage exists to produce.
+  // The number this whole stage exists to produce, kept but demoted to small
+  // print — it is instrumentation, not something you read while riding.
   if (lastWakeMs > 0) {
-    gfx->setTextColor(RGB565_CYAN);
-    gfx->setCursor(6, 62);
-    gfx->printf("wake %lu ms", (unsigned long)lastWakeMs);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "WAKE %luMS", (unsigned long)lastWakeMs);
+    textRight(buf, &ZwiftSmall11, SCREEN_W - 6, 30, C_MUTED);
   }
+
+  // Status pill: dot plus word, ringed in the state colour. A filled dot is
+  // readable at arm's length when the word is not.
+  const char *state = connected ? "CONNECTED" : "PAIRING";
+  uint16_t    col   = connected ? C_GREEN : C_AMBER;
+  int16_t     pw    = textWidth(state, &ZwiftBold14) + 36;
+  gfx->fillRoundRect(4, 46, pw, 26, 13, C_SURFACE);
+  gfx->drawRoundRect(4, 46, pw, 26, 13, col);
+  gfx->fillCircle(19, 59, 5, col);
+  textAt(state, &ZwiftBold14, 30, 64, col);
 
   // Ride On counter, colour-matched to the AUTO button: green while it is
   // really firing, amber while armed but stalled on a dropped link.
   if (autoRideOn) {
-    gfx->setTextColor(connected ? RGB565_GREEN : RGB565_ORANGE);
-    gfx->setCursor(140, 62);
-    gfx->printf("RO:%lu", (unsigned long)rideOnCount);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "RO %lu", (unsigned long)rideOnCount);
+    textRight(buf, &ZwiftBold14, SCREEN_W - 6, 64, connected ? C_GREEN : C_AMBER);
   }
+
+  gfx->drawFastHLine(0, HEADER_H - 4, SCREEN_W, C_LINE);
 }
 
 static void drawFooter() {
-  gfx->setTextColor(RGB565_DARKGREY);
-  gfx->setTextSize(1);
-  gfx->setCursor(6, 424);
-  gfx->print("rocker = left/right (works dark)");
-  gfx->setCursor(6, 440);
-  gfx->print("GPIO0  = wake / tap Enter / hold Esc");
-  gfx->setCursor(6, 456);
+  gfx->drawFastHLine(0, 404, SCREEN_W, C_LINE);
+  textAt("ROCKER  L/R ARROWS, WORKS SCREEN OFF", &ZwiftSmall11, 6, 424, C_MUTED);
+  textAt("GPIO0   WAKE, TAP=ENTER, HOLD=ESC",    &ZwiftSmall11, 6, 440, C_MUTED);
   if (bondsCleared) {
-    gfx->setTextColor(RGB565_YELLOW);
-    gfx->print("BONDS CLEARED - forget device on PC too");
+    textAt("BONDS CLEARED - FORGET DEVICE ON PC", &ZwiftSmall11, 6, 456, C_AMBER);
   } else {
-    gfx->print("hold both rocker halves at boot = clear bonds");
+    textAt("BOTH ROCKERS AT BOOT = CLEAR BONDS",  &ZwiftSmall11, 6, 456,
+           mix565(C_LINE, C_MUTED, 120));
   }
 }
 
 static void drawAll(bool connected) {
-  gfx->fillScreen(RGB565_BLACK);
+  gfx->fillScreen(C_BG);
   drawStatus(connected);
+  drawRecess(COL0, ROW2);
+  drawRecess(COL2, ROW2);
   for (size_t i = 0; i < PAD_COUNT; i++) drawPadButton(pad[i], false);
   drawFooter();
 }
@@ -465,8 +741,7 @@ static void padRelease() {
       activePadSent = false;
     }
     drawPadButton(*activePad, false);
-    Serial.printf("[pad] release %s\n",
-                  activePad->glyph == Glyph::Text ? activePad->label : "arrow");
+    Serial.printf("[pad] release %s\n", padName(*activePad));
     activePad = nullptr;
   }
 }
@@ -518,8 +793,7 @@ static void touchUpdate(bool connected) {
         keyboard.press(b.keycode);
         activePadSent = true;
       }
-      Serial.printf("[pad] press %s%s\n",
-                    b.glyph == Glyph::Text ? b.label : "arrow",
+      Serial.printf("[pad] press %s%s\n", padName(b),
                     connected ? "" : " — not connected");
       return;
     }
@@ -612,7 +886,11 @@ void setup() {
   ledcWrite(TFT_BL, 0);
 
   if (!gfx->begin()) Serial.println("ERROR: gfx->begin() failed!");
-  gfx->fillScreen(RGB565_BLACK);
+  gfx->fillScreen(C_BG);
+  // Every string on this screen uses a proportional font, and the integer
+  // scaler exists only for the built-in 5x7 bitmap. Set it once to 1 and never
+  // touch it again: scaling a real font just multiplies its pixels.
+  gfx->setTextSize(1);
 
   touch.setPins(TOUCH_RST, TOUCH_IRQ);
   if (!touch.begin(Wire, CST226SE_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
